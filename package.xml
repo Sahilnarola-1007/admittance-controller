@@ -16,6 +16,7 @@
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>kinova_wrapper</depend>
   <depend>rcl_interfaces</depend>
 
   <export>
