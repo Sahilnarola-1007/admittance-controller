@@ -1,13 +1,9 @@
 # =============================================================================
-# Admittance Controller Configuration — Kinova Gen3
+# Admittance Controller Configuration — Kinova Gen3 + MAE SensuReal F/T Sensor
 # =============================================================================
-# Day 22: Force/Torque Sensing Fundamentals
 #
-# This node talks directly to the Kortex API (not through ros2_kortex driver)
-# because the driver doesn't expose wrench data yet.
-#
-# The controller reads force → converts to position offset → sends new target.
-# F_ext / K = displacement. That's the whole idea.
+# Wrench source: MAE SensuReal via mae_sensor_node (/wrench_raw topic).
+# Falls back to Kortex getWrench() if sensor node not running.
 # =============================================================================
 
 admittance_node:
@@ -32,9 +28,9 @@ admittance_node:
 
     # --- Dead Zone ---
     # Forces below this are treated as noise (set to zero)
-    # Kinova's torque-based estimation has ~1-2N residual
-    dead_zone_force: 1.5         # Newtons
-    dead_zone_torque: 0.5        # Nm (not used in v1, but ready for rotation)
+    # MAE SensuReal noise floor: ~0.01N, drift: ~0.1-0.3N
+    dead_zone_force: 0.3         # Newtons (was 1.5N for Kinova built-in)
+    dead_zone_torque: 0.1        # Nm
 
     # --- Safety Limits ---
     # Maximum displacement from desired position (meters)
@@ -55,3 +51,21 @@ admittance_node:
     # Number of samples to average when taring (zeroing) the sensor
     tare_samples: 100
     tare_sample_interval_ms: 10  # ms between samples during tare
+
+    # --- Gravity Model (Robotiq 2F-85) ---
+    gripper_mass: 0.93           # kg
+    cog_x: 0.0                  # m, tool frame
+    cog_y: 0.0
+    cog_z: 0.058
+
+# =============================================================================
+# MAE SensuReal F/T Sensor Driver
+# =============================================================================
+mae_sensor_node:
+  ros__parameters:
+    sensor_ip: "192.168.1.11"
+    sensor_port: 10547
+    sampling_period_us: 1000     # 1kHz sensor rate
+    publish_rate_hz: 500.0       # Publish every 2nd sample
+    auto_bias: true              # Tare on activate
+    frame_id: "sensor_frame"

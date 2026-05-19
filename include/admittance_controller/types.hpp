@@ -68,13 +68,13 @@ public:
     alpha_ = std::clamp(alpha, 0.01, 1.0);
   }
 
-  Wrench update(const Wrench& raw) {
-    filtered_.fx += alpha_ * (raw.fx - filtered_.fx);
-    filtered_.fy += alpha_ * (raw.fy - filtered_.fy);
-    filtered_.fz += alpha_ * (raw.fz - filtered_.fz);
-    filtered_.tx += alpha_ * (raw.tx - filtered_.tx);
-    filtered_.ty += alpha_ * (raw.ty - filtered_.ty);
-    filtered_.tz += alpha_ * (raw.tz - filtered_.tz);
+  Wrench update(const Wrench& corrected) {
+    filtered_.fx += alpha_ * (corrected.fx - filtered_.fx);
+    filtered_.fy += alpha_ * (corrected.fy - filtered_.fy);
+    filtered_.fz += alpha_ * (corrected.fz - filtered_.fz);
+    filtered_.tx += alpha_ * (corrected.tx - filtered_.tx);
+    filtered_.ty += alpha_ * (corrected.ty - filtered_.ty);
+    filtered_.tz += alpha_ * (corrected.tz - filtered_.tz);
     return filtered_;
   }
 

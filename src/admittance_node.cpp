@@ -3,14 +3,16 @@
 // =============================================================================
 // Day 22: Force/Torque Sensing Fundamentals
 //
-// This node uses KinovaInterface wrapper to access the Kortex API.
-// The ros2_kortex driver doesn't expose wrench data, so we go direct.
+// This node subscribes to wrench data from the MAE SensuReal F/T sensor
+// via the mae_sensor_node (Python), which publishes WrenchStamped on
+// /wrench_raw. Alternatively, falls back to KinovaInterface::getWrench()
+// if no external wrench topic is available.
 //
 // What it does:
 //   1. On startup: reads current EE position → stores as x_desired
 //   2. Optionally tares the sensor (for residual model error)
 //   3. Every loop cycle:
-//      - Reads wrench from KinovaInterface
+//      - Reads wrench from /wrench_raw topic (MAE sensor via mae_sensor_node)
 //      - Computes gravity wrench from current orientation (model-based)
 //      - Subtracts gravity + residual bias
 //      - Filters (exponential moving average)
@@ -33,6 +35,7 @@
 #include <atomic>
 #include <csignal>
 #include <cmath>
+#include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/wrench_stamped.hpp"
@@ -64,7 +67,7 @@ public:
     declare_parameter("stiffness_y", 200.0);
     declare_parameter("stiffness_z", 200.0);
 
-    declare_parameter("dead_zone_force", 1.5);
+    declare_parameter("dead_zone_force", 0.3);
     declare_parameter("dead_zone_torque", 0.5);
 
     declare_parameter("max_displacement_x", 0.05);
@@ -87,13 +90,26 @@ public:
     load_params();
 
     // ------------------------------------------------------------------
-    // Publishers: corrected wrench for debugging/visualization
+    // Publisher: corrected wrench for debugging/visualization
     // ------------------------------------------------------------------
     wrench_pub_ = create_publisher<geometry_msgs::msg::WrenchStamped>(
       "~/wrench_corrected", 10);
 
-    raw_wrench_pub_ = create_publisher<geometry_msgs::msg::WrenchStamped>(
-      "~/wrench_raw", 10);
+    // ------------------------------------------------------------------
+    // Subscriber: receive wrench from MAE sensor driver node
+    // ------------------------------------------------------------------
+    wrench_sub_ = create_subscription<geometry_msgs::msg::WrenchStamped>(
+      "/wrench_raw", rclcpp::SensorDataQoS(),
+      [this](const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(wrench_mutex_);
+        latest_wrench_.fx = msg->wrench.force.x;
+        latest_wrench_.fy = msg->wrench.force.y;
+        latest_wrench_.fz = msg->wrench.force.z;
+        latest_wrench_.tx = msg->wrench.torque.x;
+        latest_wrench_.ty = msg->wrench.torque.y;
+        latest_wrench_.tz = msg->wrench.torque.z;
+        wrench_received_ = true;
+      });
 
     // ------------------------------------------------------------------
     // Services: tare and enable/disable
@@ -193,7 +209,7 @@ public:
       std::chrono::milliseconds(1000 / rate),
       [this]() { control_loop(); });
 
-    enabled_ = true;
+    enabled_ = false;
     RCLCPP_INFO(get_logger(),
       "Admittance controller running at %d Hz. Push the EE!", rate);
     RCLCPP_INFO(get_logger(),
@@ -205,7 +221,7 @@ public:
       "  Gripper mass: %.3f kg  |  CoG: [%.3f, %.3f, %.3f] m",
       gripper_mass_, cog_x_, cog_y_, cog_z_);
     RCLCPP_INFO(get_logger(), "Services: ~/tare  ~/enable  ~/disable");
-    RCLCPP_INFO(get_logger(), "Topics:   ~/wrench_corrected  ~/wrench_raw");
+    RCLCPP_INFO(get_logger(), "Topics:   ~/wrench_corrected  (subscribes: /wrench_raw)");
 
     return true;
   }
@@ -247,19 +263,28 @@ private:
   }
 
   // ========================================================================
-  // read_wrench(): get current wrench from KinovaInterface
+  // read_wrench(): get latest wrench from /wrench_raw topic (MAE sensor)
+  //
+  // Falls back to KinovaInterface::getWrench() if no topic data received
+  // (e.g. when testing without the MAE sensor node running).
   // ========================================================================
   admittance::Wrench read_wrench() {
-    auto w_vec = kinova_->getWrench();
+    {
+      std::lock_guard<std::mutex> lock(wrench_mutex_);
+      if (wrench_received_) {
+        return latest_wrench_;
+      }
+    }
 
+    // Fallback: read from Kortex API directly (no MAE sensor)
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "No wrench data on /wrench_raw — falling back to Kortex getWrench()");
+
+    auto w_vec = kinova_->getWrench();
     admittance::Wrench w;
     if (w_vec.size() == 6) {
-      w.fx = w_vec[0];
-      w.fy = w_vec[1];
-      w.fz = w_vec[2];
-      w.tx = w_vec[3];
-      w.ty = w_vec[4];
-      w.tz = w_vec[5];
+      w.fx = w_vec[0]; w.fy = w_vec[1]; w.fz = w_vec[2];
+      w.tx = w_vec[3]; w.ty = w_vec[4]; w.tz = w_vec[5];
     }
     return w;
   }
@@ -374,7 +399,6 @@ private:
 
     // --- 1. Read raw wrench ---
     admittance::Wrench raw = read_wrench();
-    publish_wrench(raw_wrench_pub_, raw);
 
     // --- 2. Model-based gravity compensation ---
     // Get current orientation (updates every cycle → works at any config)
@@ -477,12 +501,17 @@ private:
 
   // ROS2 pub/sub/srv
   rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr raw_wrench_pub_;
+  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr tare_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr enable_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disable_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
+
+  // Wrench from MAE sensor topic (thread-safe cache)
+  admittance::Wrench latest_wrench_;
+  std::mutex wrench_mutex_;
+  bool wrench_received_ = false;
 
   // Admittance state
   admittance::Wrench bias_;                   // residual bias (model error)
