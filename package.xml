@@ -18,6 +18,7 @@
   <depend>std_srvs</depend>
   <depend>kinova_wrapper</depend>
   <depend>rcl_interfaces</depend>
+  <depend>eigen</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

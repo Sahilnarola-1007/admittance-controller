@@ -15,48 +15,50 @@ admittance_node:
     password: "admin"
 
     # --- Control Loop ---
-    loop_rate_hz: 100             # Hz — how fast the admittance loop runs
-                                  # 100Hz is fine for high-level servoing
+    loop_rate_hz: 100             # Hz — admittance loop frequency
 
-    # --- Admittance Gains (the K in x_cmd = x_des + F/K) ---
-    # Higher K = stiffer (less movement per Newton)
-    # Lower K  = more compliant (more movement per Newton)
-    # Start HIGH (stiff) and lower gradually!
-    stiffness_x: 200.0           # N/m — lateral
-    stiffness_y: 200.0           # N/m — lateral
-    stiffness_z: 200.0           # N/m — vertical
+    # --- Damping Gains (D in v = F/D) ---
+    # Units: N·s/m — force needed to produce 1 m/s velocity
+    # Higher = stiffer, Lower = more compliant
+    # Start HIGH and lower gradually!
+    damping_x: 150.0
+    damping_y: 150.0
+    damping_z: 150.0
+
+    # --- Position Regulation Gain ---
+    # Kp in v += Kp*(desired - current)  [1/s]
+    # Equilibrium displacement = F / (D × Kp)
+    position_gain: 2.0
 
     # --- Dead Zone ---
-    # Forces below this are treated as noise (set to zero)
-    # MAE SensuReal noise floor: ~0.01N, drift: ~0.1-0.3N
-    dead_zone_force: 0.3         # Newtons (was 1.5N for Kinova built-in)
+    # Forces below this treated as zero
+    # MAE SensuReal drift envelope: ~0.1–0.3N
+    dead_zone_force: 0.3         # Newtons
     dead_zone_torque: 0.1        # Nm
 
     # --- Safety Limits ---
-    # Maximum displacement from desired position (meters)
-    # The robot will NEVER move further than this, no matter how hard you push
     max_displacement_x: 0.05     # 5cm
     max_displacement_y: 0.05     # 5cm
     max_displacement_z: 0.05     # 5cm
-
-    # Maximum velocity (m/s) — rate-limits sudden jumps
-    max_velocity: 0.1            # 10 cm/s
+    max_velocity: 0.15           # 15 cm/s
 
     # --- Filter ---
-    # Exponential moving average: 0.0 = no update, 1.0 = no filtering
-    # Lower = smoother but laggier, Higher = responsive but noisier
+    # EMA: 0.1 = heavy smoothing, 1.0 = no filtering
     filter_alpha: 0.1
 
     # --- Tare ---
-    # Number of samples to average when taring (zeroing) the sensor
     tare_samples: 100
-    tare_sample_interval_ms: 10  # ms between samples during tare
+    tare_sample_interval_ms: 10
 
-    # --- Gravity Model (Robotiq 2F-85) ---
-    gripper_mass: 0.93           # kg
-    cog_x: 0.0                  # m, tool frame
+    # --- Gravity Model ---
+    # Current: test handle (~175g) on F/T sensor flange, no gripper
+    # Sequence: robot → flange → F/T sensor → test handle
+    # CoG unknown → set to [0,0,0], tare absorbs the residual
+    # When Robotiq 2F-85 is installed: mass=0.93, cog_z=0.058
+    gripper_mass: 0.175          # kg
+    cog_x: 0.0                  # m, in tool frame
     cog_y: 0.0
-    cog_z: 0.058
+    cog_z: 0.0
 
 # =============================================================================
 # MAE SensuReal F/T Sensor Driver
@@ -68,4 +70,4 @@ mae_sensor_node:
     sampling_period_us: 1000     # 1kHz sensor rate
     publish_rate_hz: 500.0       # Publish every 2nd sample
     auto_bias: true              # Tare on activate
-    frame_id: "sensor_frame"
+    frame_id: "tool_frame"

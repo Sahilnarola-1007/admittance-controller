@@ -12,6 +12,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(kinova_wrapper REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 # Build the admittance controller node
 add_executable(admittance_node
@@ -21,6 +22,8 @@ add_executable(admittance_node
 target_include_directories(admittance_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  ${EIGEN3_INCLUDE_DIRS}
+  
 )
 
 ament_target_dependencies(admittance_node
@@ -29,6 +32,7 @@ ament_target_dependencies(admittance_node
   std_srvs
   rcl_interfaces
   kinova_wrapper
+  Eigen3
 )
 
 target_compile_features(admittance_node PUBLIC cxx_std_17)
