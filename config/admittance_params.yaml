@@ -2,6 +2,8 @@
 # Admittance Controller Configuration — Kinova Gen3 + MAE SensuReal F/T Sensor
 # =============================================================================
 #
+# Full 6-DOF admittance control: linear (force→velocity) + angular (torque→ω).
+#
 # Wrench source: MAE SensuReal via mae_sensor_node (/wrench_raw topic).
 # Falls back to Kortex getWrench() if sensor node not running.
 # =============================================================================
@@ -17,7 +19,7 @@ admittance_node:
     # --- Control Loop ---
     loop_rate_hz: 100             # Hz — admittance loop frequency
 
-    # --- Damping Gains (D in v = F/D) ---
+    # --- Linear Damping Gains (D in v = F/D) ---
     # Units: N·s/m — force needed to produce 1 m/s velocity
     # Higher = stiffer, Lower = more compliant
     # Start HIGH and lower gradually!
@@ -25,25 +27,38 @@ admittance_node:
     damping_y: 150.0
     damping_z: 150.0
 
-    # --- Position Regulation Gain ---
+    # --- Angular Damping Gains (D in ω = τ/D) ---
+    # Units: Nm·s/rad — torque needed to produce 1 rad/s angular velocity
+    # Start HIGH — angular motion is more dangerous than linear
+    damping_x_angular: 5.0
+    damping_y_angular: 5.0
+    damping_z_angular: 5.0
+
+    # --- Linear Position Regulation Gain ---
     # Kp in v += Kp*(desired - current)  [1/s]
     # Equilibrium displacement = F / (D × Kp)
     position_gain: 2.0
 
-    # --- Dead Zone ---
-    # Forces below this treated as zero
-    # MAE SensuReal drift envelope: ~0.1–0.3N
-    dead_zone_force: 0.3         # Newtons
-    dead_zone_torque: 0.1        # Nm
+    # --- Orientation Regulation Gains ---
+    # Proportional angular velocity per radian of orientation error [1/s]
+    # Uses quaternion-based error (singularity-free, no gimbal lock)
+    Kp_x_angular: 0.5
+    Kp_y_angular: 0.5
+    Kp_z_angular: 0.5
+
+    # --- Dead Zones ---
+    # Readings below these thresholds treated as zero
+    # MAE SensuReal drift envelope: ~0.1–0.3N force, ~0.05–0.1Nm torque
+    dead_zone_force: 0.3          # Newtons
+    dead_zone_torque: 0.2         # Nm
 
     # --- Safety Limits ---
-    max_displacement_x: 0.05     # 5cm
-    max_displacement_y: 0.05     # 5cm
-    max_displacement_z: 0.05     # 5cm
-    max_velocity: 0.15           # 15 cm/s
+    max_velocity: 0.2             # 20 cm/s — linear
+    max_angular_velocity: 0.9     # 0.9 rad/s (~51.56°/s) — angular
 
     # --- Filter ---
     # EMA: 0.1 = heavy smoothing, 1.0 = no filtering
+    # Applied to all 6 channels (Fx, Fy, Fz, Tx, Ty, Tz)
     filter_alpha: 0.1
 
     # --- Tare ---
@@ -55,8 +70,8 @@ admittance_node:
     # Sequence: robot → flange → F/T sensor → test handle
     # CoG unknown → set to [0,0,0], tare absorbs the residual
     # When Robotiq 2F-85 is installed: mass=0.93, cog_z=0.058
-    gripper_mass: 0.175          # kg
-    cog_x: 0.0                  # m, in tool frame
+    gripper_mass: 0.175           # kg
+    cog_x: 0.0                   # m, in tool frame
     cog_y: 0.0
     cog_z: 0.0
 
@@ -67,7 +82,7 @@ mae_sensor_node:
   ros__parameters:
     sensor_ip: "192.168.1.11"
     sensor_port: 10547
-    sampling_period_us: 1000     # 1kHz sensor rate
-    publish_rate_hz: 500.0       # Publish every 2nd sample
-    auto_bias: true              # Tare on activate
+    sampling_period_us: 1000      # 1kHz sensor rate
+    publish_rate_hz: 500.0        # Publish every 2nd sample
+    auto_bias: true               # Tare on activate
     frame_id: "tool_frame"
