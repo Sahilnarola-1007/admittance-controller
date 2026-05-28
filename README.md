@@ -37,21 +37,21 @@ mae_sensor_node (Python lifecycle, publishes /wrench_raw at 500Hz)
 ┌─────────────────────────────────────────────────────────────────┐
 │                      admittance_node (C++, 100Hz)               │
 │                                                                 │
-│  /wrench_raw ──→ Gravity Comp ──→ EMA Filter ──→ Dead Zone     │
+│  /wrench_raw ──→ Gravity Comp ──→ EMA Filter ──→ Dead Zone      │
 │                  (model-based)    (6 channels)   (F: 0.3N,      │
-│                                                   T: 0.1Nm)     │
+│                                                   T: 0.2Nm)     │
 │                       │                                         │
 │                       ▼                                         │
 │              ┌─────────────────┐     ┌──────────────────────┐   │
-│              │  LINEAR          │     │  ANGULAR              │  │
-│              │  F_base = R·F    │     │  q_err = q_d·q_c⁻¹   │  │
-│              │  v = F/D + Kp·e  │     │  ω = τ/D + Kp·2·q.v  │  │
+│              │  LINEAR         │     │  ANGULAR             │   │
+│              │  F_base = R·F   │     │  q_err = q_d·q_c⁻¹   │   │
+│              │  v = F/D + Kp·e │     │  ω = τ/D + Kp·2·q.v  │   │
 │              └────────┬────────┘     └──────────┬───────────┘   │
 │                       │                         │               │
 │                       ▼                         ▼               │
 │                 ┌─────────────────────────────────┐             │
-│                 │  Safety Clamp + Dead Zone Check  │             │
-│                 │  v < 0.2m/s   ω < 0.5rad/s      │             │
+│                 │  Safety Clamp + Dead Zone Check │             │
+│                 │  v < 0.2m/s   ω < 0.9rad/s      │             │
 │                 └──────────────┬──────────────────┘             │
 │                                │                                │
 │                                ▼                                │
