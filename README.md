@@ -37,14 +37,14 @@ mae_sensor_node (Python lifecycle, publishes /wrench_raw at 500Hz)
 ┌─────────────────────────────────────────────────────────────────┐
 │                      admittance_node (C++, 100Hz)               │
 │                                                                 │
-│  /wrench_raw ──→ Gravity Comp ──→ EMA Filter ──→ Dead Zone      │
+│  /wrench_raw ---→ Gravity Comp ---→ EMA Filter ---→ Dead Zone   │
 │                  (model-based)    (6 channels)   (F: 0.3N,      │
 │                                                   T: 0.2Nm)     │
 │                       │                                         │
 │                       ▼                                         │
 │              ┌─────────────────┐     ┌──────────────────────┐   │
-│              │  LINEAR         │     │  ANGULAR             │   │
-│              │  F_base = R·F   │     │  q_err = q_d·q_c⁻¹   │   │
+│              │     LINEAR      │     │       ANGULAR        │   │
+│              │F_base = R·F_tool│     │  q_err = q_d·q_c⁻¹   │   │
 │              │  v = F/D + Kp·e │     │  ω = τ/D + Kp·2·q.v  │   │
 │              └────────┬────────┘     └──────────┬───────────┘   │
 │                       │                         │               │
@@ -159,17 +159,17 @@ All parameters are dynamically reconfigurable at runtime via `ros2 param set`.
 
 | Parameter | Default | Units | Description |
 |-----------|---------|-------|-------------|
-| `damping_x/y/z_angular` | 10.0 | Nm·s/rad | Torque needed to produce 1 rad/s angular velocity. |
-| `Kp_x/y/z_angular` | 2.0 | 1/s | Orientation regulation gain (per radian of quaternion error). |
+| `damping_x/y/z_angular` | 5.0 | Nm·s/rad | Torque needed to produce 1 rad/s angular velocity. |
+| `Kp_x/y/z_angular` | 0.5 | 1/s | Orientation regulation gain (per radian of quaternion error). |
 
 ### Safety
 
 | Parameter | Default | Units | Description |
 |-----------|---------|-------|-------------|
 | `max_velocity` | 0.2 | m/s | Linear velocity clamp. |
-| `max_angular_velocity` | 0.5 | rad/s | Angular velocity clamp (~28.6°/s). |
+| `max_angular_velocity` | 0.9 | rad/s | Angular velocity clamp (~28.6°/s). |
 | `dead_zone_force` | 0.3 | N | Force readings below this are zeroed. |
-| `dead_zone_torque` | 0.1 | Nm | Torque readings below this are zeroed. |
+| `dead_zone_torque` | 0.2 | Nm | Torque readings below this are zeroed. |
 
 ### Gravity Model
 
@@ -259,12 +259,6 @@ mae_sensor_driver/                      # Separate package
 - [kinova_wrapper](https://github.com/Sahilnarola-1007/kinova-wrapper) — C++ wrapper for Kortex SDK
 - [mae_fts_sdk](https://github.com/MAE-Robotics) — MAE SensuReal Python SDK
 - ROS2 Jazzy, Eigen3, geometry_msgs, std_srvs
-
-## What's Next
-
-- Surface wiping demo (constant-force contact with orientation maintenance)
-- Mount Robotiq 2F-85 gripper (update gravity model: mass=0.93, cog_z=0.058)
-- Measure actual CoG for improved gravity torque compensation at all orientations
 
 ## Author
 
