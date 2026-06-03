@@ -113,12 +113,15 @@ flip in the chain.
 The control loop is configured at 100 Hz but achieves **~13 Hz** due to
 Kortex high-level API latency:
 
-```mermaid
-pie title Control Loop Time Budget (73.5 ms total)
-    "setCartesianVelocity (gRPC)" : 73.3
-    "Control Math" : 0.2
-    "Wrench Read" : 0.01
-    "Pose Read" : 0.01
+```
+ Section               Time        Bottleneck?
+ ─────────────────────────────────────────────────────────────────
+ wrench read           0.0 ms   ▏
+ getCurrentPose        0.0 ms   ▏  (background thread cache)
+ control math          0.2 ms   ▎  (gravity + EMA + admittance + quaternion)
+ setCartesianVelocity  73.3 ms  ████████████████████████████████████████  ← gRPC bottleneck
+ ─────────────────────────────────────────────────────────────────
+ TOTAL                 73.5 ms  → ~13 Hz effective loop rate
 ```
 
 | Section | Time | What |
