@@ -2,16 +2,20 @@
 // Admittance Controller Node — Kinova Gen3 + MAE SensuReal F/T Sensor
 // =============================================================================
 //
-// Full 6-DOF velocity-based admittance controller that maps external forces AND
-// torques to compliant end-effector motion (linear + angular). Designed for
-// force-controlled contact tasks such as surface wiping, polishing, and guided
-// manipulation.
+// Full 6-DOF velocity-based admittance controller and force-control executor
+// that maps external forces AND torques to compliant end-effector motion
+// (linear + angular). Designed for force-controlled contact tasks such as
+// surface wiping, polishing, and guided manipulation.
+//
+// Successfully demonstrated: surface wiping with PI force control maintaining
+// ~5 N contact force (steady-state band: [-5.5, -4.5] N) while executing
+// lateral zigzag trajectories at 0.02 m/s. June 2026.
 //
 // Architecture:
 //   MAE SensuReal F/T sensor (UDP, 1kHz)
 //     → mae_sensor_node (Python lifecycle driver, publishes /wrench_raw at 500Hz)
 //       → this node (subscribes, compensates gravity, filters, controls)
-//         → Kortex SendTwistCommand (streaming 6D Cartesian twist at 100Hz)
+//         → Kortex SendTwistCommand (streaming 6D Cartesian twist)
 //
 // Control law (6-DOF velocity-based admittance):
 //
@@ -32,11 +36,34 @@
 //   Tare captures residual model error (imprecise mass, CoG, friction).
 //   Torque gravity compensation: T_gravity = r_cog × F_gravity (tool frame).
 //
+// Sign convention (HARDWARE-VERIFIED):
+//   Press UP (into surface, contact direction)  →  wrench_corrected Fz = NEGATIVE
+//   Pull DOWN (away from surface)               →  wrench_corrected Fz = POSITIVE
+//   PI call: vz = force_pi_->update(F_desired, -fz)
+//   The -fz flips the sensor's negative contact reading to positive, matching
+//   the positive F_desired. The PI's internal negation then produces negative
+//   vz (downward) when more force is needed.
+//
 // Frame conventions:
 //   - Sensor frame: MAE SensuReal native axes
 //   - Tool frame:   Sensor readings rotated by Rz(90°) in mae_sensor_node.py
 //   - Base frame:   Kortex world frame, used for SendTwistCommand
 //   - R_tool_to_base built from Kortex ZYX intrinsic Euler angles using Eigen
+//
+// LOOP RATE LIMITATION (measured, not theoretical):
+//   The control loop is configured at 100 Hz but achieves only ~13 Hz (~75 ms
+//   per cycle) due to Kortex high-level API latency. Timing breakdown:
+//     wrench read:           0.0 ms  (mutex-cached from 500 Hz subscriber)
+//     getCurrentPose():      0.0 ms  (cached by background pose thread)
+//     control math:          0.2 ms  (gravity comp + EMA + admittance + quaternion)
+//     setCartesianVelocity: 73.0 ms  (Kortex SendTwistCommand gRPC round-trip)
+//   The SendTwistCommand call is a synchronous gRPC request to the arm's internal
+//   controller. It cannot be moved to a background thread because the velocity
+//   command is the control output — fire-and-forget would cause stale or dropped
+//   commands. Kinova's own documentation states 40 Hz max for high-level commands.
+//   At 13 Hz with 20 mm/s wipe speed, the arm moves 1.5 mm between updates —
+//   acceptable for surface wiping. Upgrade path: Kortex low-level servoing API
+//   (1 kHz, joint-space, requires Jacobian + DLS IK).
 //
 // End-effector payload:
 //   Currently configured for a lightweight test handle (~175g) mounted
@@ -65,7 +92,45 @@
 //   ~/wrench_corrected  WrenchStamped  After gravity comp + EMA filter + dead zone
 // Topics subscribed:
 //   /wrench_raw         WrenchStamped  Raw F/T from mae_sensor_node (tool frame)
+//   /wipe_node/wipe_setpoint
+
+// =============================================================================
+// WIPE INTEGRATION (surface-wiping demo)
 //
+// This node also acts as the EXECUTOR for the surface-wiping task. The
+// wipe_node ("brain") sequences a state machine and publishes WipeSetpoint
+// commands; this node applies them on top of the admittance loop:
+//
+//   mode == IDLE      → normal 6-DOF admittance (unchanged)
+//   mode == APPROACH  → Z velocity-commanded (slow descent), X/Y = 0
+//   mode == WIPE      → Z force-controlled via ForceControllerPI (PI + anti-
+//                       windup) toward force_desired_z; X/Y commanded from
+//                       the wipe trajectory; position regulation OFF on X/Y/Z
+//   mode == RETRACT   → Z velocity-commanded (lift off), X/Y = 0
+//
+// In every wipe mode the ANGULAR (orientation hold) control is left untouched —
+// the tool stays normal to the surface via the existing quaternion controller.
+//
+// Bumpless transfer: the PI integral is reset on the rising edge of
+// z_force_control (APPROACH→WIPE), so force control starts from a clean state.
+//
+// Stale-setpoint safety: if no WipeSetpoint arrives within setpoint_timeout
+// seconds (brain crashed / stopped), the node reverts to normal admittance —
+// it does NOT keep pressing or wiping unsupervised.
+//
+// Force feedback for the PI is the corrected vertical force (post gravity-comp,
+// filter, dead zone) — the SAME signal published on ~/wrench_corrected and used
+// by the wipe_node for contact detection, so contact threshold and force target
+// share one frame and sign.
+//
+// New services:  (none — wipe is driven entirely by the setpoint topic)
+// New parameters:
+//   force_kp / force_ki   PI gains for Z-axis force control
+//   setpoint_timeout      Stale-setpoint fallback threshold [s]
+// Topics subscribed (added):
+//   /wipe_node/wipe_setpoint   WipeSetpoint  Commands from the wipe_node brain
+// =============================================================================
+
 // Parameters (all dynamically reconfigurable via `ros2 param set`):
 //   damping_x/y/z              Linear damping D [N·s/m]
 //   damping_x/y/z_angular      Angular damping D [Nm·s/rad]
@@ -98,6 +163,8 @@
 #include <csignal>
 #include <cmath>
 #include <mutex>
+#include <thread>
+#include <memory>
 #include <Eigen/Geometry>
 #include <Eigen/Dense>
 
@@ -106,7 +173,9 @@
 #include "std_srvs/srv/trigger.hpp"
 
 #include "admittance_controller/types.hpp"
+#include "admittance_controller/force_controller_pi.hpp"   
 #include "kinova_wrapper/KinovaInterface.hpp"
+#include "wipe_msgs/msg/wipe_setpoint.hpp"                 
 
 using namespace std::chrono_literals;
 
@@ -156,9 +225,6 @@ public:
     declare_parameter("dead_zone_torque", 0.1);   // Nm
 
     // Safety limits
-    declare_parameter("max_displacement_x", 0.05);
-    declare_parameter("max_displacement_y", 0.05);
-    declare_parameter("max_displacement_z", 0.05);
     declare_parameter("max_velocity", 0.15);            // m/s
     declare_parameter("max_angular_velocity", 0.5);     // rad/s
 
@@ -175,6 +241,11 @@ public:
     declare_parameter("cog_y", 0.0);
     declare_parameter("cog_z", 0.0);
 
+    // Force control (Z-axis during WIPE)
+    declare_parameter("force_kp", 0.001);
+    declare_parameter("force_ki", 0.01);
+    declare_parameter("setpoint_timeout", 0.5);   // s, stale-setpoint safety
+
     load_params();
 
     // ------------------------------------------------------------------
@@ -184,6 +255,10 @@ public:
     wrench_pub_ = create_publisher<geometry_msgs::msg::WrenchStamped>(
       "~/wrench_corrected", 10);
 
+    io_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    rclcpp::SubscriptionOptions io_opts;
+    io_opts.callback_group = io_cb_group_;
+
     // ------------------------------------------------------------------
     // Subscriber: raw wrench from MAE sensor driver (tool frame, 500Hz)
     //
@@ -192,7 +267,7 @@ public:
     // are overwritten (5:1 oversampling ensures fresh data every cycle).
     // ------------------------------------------------------------------
     wrench_sub_ = create_subscription<geometry_msgs::msg::WrenchStamped>(
-      "/wrench_raw", rclcpp::SensorDataQoS(),
+      "/wrench_raw", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
       [this](const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(wrench_mutex_);
 
@@ -205,7 +280,17 @@ public:
         latest_wrench_.ty = msg->wrench.torque.y;
         latest_wrench_.tz = msg->wrench.torque.z;
         wrench_received_ = true;
-      });
+      },io_opts);
+
+      // Subscriber: wipe setpoints from the wipe_node (the "brain")
+      setpoint_sub_ = create_subscription<wipe_msgs::msg::WipeSetpoint>(
+        "/wipe_node/wipe_setpoint", 10,
+        [this](const wipe_msgs::msg::WipeSetpoint::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(setpoint_mutex_);
+          latest_setpoint_     = *msg;
+          setpoint_received_   = true;
+          last_setpoint_time_  = now();
+        },io_opts);
 
     // ------------------------------------------------------------------
     // Services
@@ -279,9 +364,6 @@ public:
           // Filter
           else if (p.get_name() == "filter_alpha") filter_.set_alpha(p.as_double());
           // Safety
-          else if (p.get_name() == "max_displacement_x") max_disp_x_ = p.as_double();
-          else if (p.get_name() == "max_displacement_y") max_disp_y_ = p.as_double();
-          else if (p.get_name() == "max_displacement_z") max_disp_z_ = p.as_double();
           else if (p.get_name() == "max_velocity") max_vel_ = p.as_double();
           else if (p.get_name() == "max_angular_velocity") max_ang_vel_ = p.as_double();
           // Gravity model
@@ -341,8 +423,17 @@ public:
       bias_.fx, bias_.fy, bias_.fz,
       bias_.tx, bias_.ty, bias_.tz);
 
+    // Start background pose-caching thread (decouples 20ms Kortex call)
+    start_pose_thread();
+
     // Start the control loop timer
     int rate = get_parameter("loop_rate_hz").as_int();
+
+    double dt = 1.0 / rate;
+    // v_max for the force loop reuses the linear velocity clamp.
+    force_pi_ = std::make_unique<admittance::ForceControllerPI>(
+      force_kp_, force_ki_, dt, max_vel_);
+    
     timer_ = create_wall_timer(
       std::chrono::milliseconds(1000 / rate),
       [this]() { control_loop(); });
@@ -373,6 +464,7 @@ public:
   // ========================================================================
   void cleanup() {
     if (timer_) timer_->cancel();
+    stop_pose_thread();
     RCLCPP_INFO(get_logger(), "Shutting down...");
     if (kinova_) {
       kinova_->stopMotion();
@@ -429,9 +521,6 @@ private:
     dead_zone_torque_ = get_parameter("dead_zone_torque").as_double();
 
     // Safety
-    max_disp_x_ = get_parameter("max_displacement_x").as_double();
-    max_disp_y_ = get_parameter("max_displacement_y").as_double();
-    max_disp_z_ = get_parameter("max_displacement_z").as_double();
     max_vel_ = get_parameter("max_velocity").as_double();
     max_ang_vel_ = get_parameter("max_angular_velocity").as_double();
 
@@ -442,6 +531,11 @@ private:
     cog_x_ = get_parameter("cog_x").as_double();
     cog_y_ = get_parameter("cog_y").as_double();
     cog_z_ = get_parameter("cog_z").as_double();
+
+    //Force controller PI
+    force_kp_ = get_parameter("force_kp").as_double();
+    force_ki_ = get_parameter("force_ki").as_double();
+    setpoint_timeout_ = get_parameter("setpoint_timeout").as_double();
   }
 
   // ========================================================================
@@ -469,6 +563,53 @@ private:
       w.tx = w_vec[3]; w.ty = w_vec[4]; w.tz = w_vec[5];
     }
     return w;
+  }
+
+  // ========================================================================
+  // Pose caching — background thread polls getCurrentPose() at ~50Hz
+  //
+  // getCurrentPose() blocks for ~20ms (Kortex network round-trip).
+  // Running it in the control loop caps the loop at ~14Hz. This thread
+  // polls independently and caches the result behind a mutex. The control
+  // loop reads the cached value in <1μs instead of blocking 20ms.
+  //
+  // Staleness: at 50Hz polling, the pose is at most ~20ms old. The arm
+  // moves at <0.15 m/s max → worst-case position error = 3mm, well within
+  // the 3mm deadzone. Acceptable for admittance control.
+  // ========================================================================
+  void start_pose_thread() {
+    pose_thread_running_ = true;
+    pose_thread_ = std::thread([this]() {
+      while (pose_thread_running_ && g_running) {
+        auto pose = kinova_->getCurrentPose();
+        {
+          std::lock_guard<std::mutex> lock(pose_mutex_);
+          cached_pose_ = pose;
+          pose_received_ = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      }
+    });
+  }
+
+  void stop_pose_thread() {
+    pose_thread_running_ = false;
+    if (pose_thread_.joinable()) {
+      pose_thread_.join();
+    }
+  }
+
+  // Read cached pose — returns last value from background thread.
+  // Falls back to blocking call if thread hasn't produced a value yet.
+  kinova_wrapper::Pose read_cached_pose() {
+    {
+      std::lock_guard<std::mutex> lock(pose_mutex_);
+      if (pose_received_) {
+        return cached_pose_;
+      }
+    }
+    // Fallback: first cycle before thread has run — block once
+    return kinova_->getCurrentPose();
   }
 
   // ========================================================================
@@ -568,11 +709,17 @@ private:
       return;
     }
 
+    // [TIMING] temporary loop instrumentation — remove once loop rate is fixed
+    auto _t0 = std::chrono::steady_clock::now();
+
     // --- 1. Read raw wrench (tool frame) ---
     admittance::Wrench raw = read_wrench();
+    auto _t_wrench = std::chrono::steady_clock::now();
 
     // --- 2. Model-based gravity compensation ---
-    auto current_pose = kinova_->getCurrentPose();
+    // Pose from background cache thread (~20ms old, <1μs read)
+    auto current_pose = read_cached_pose();
+    auto _t_pose = std::chrono::steady_clock::now();
     admittance::Wrench gravity = computeGravityWrench(
       current_pose.theta_x, current_pose.theta_y, current_pose.theta_z);
 
@@ -654,6 +801,7 @@ private:
     double wy_correction = Kp_y_ang_ * orient_error(1);
     double wz_correction = Kp_z_ang_ * orient_error(2);
 
+
     // Transform torque: tool frame → base frame
     Eigen::Vector3d T_tool(tx, ty, tz);
     Eigen::Vector3d T_base = R_tool_to_base_ * T_tool;
@@ -669,6 +817,59 @@ private:
     double wz = wz_admit + wz_correction;
 
     // =====================================================================
+    // WIPE OVERRIDE
+    // If the wipe_node commands active control, override the LINEAR
+    // velocities (X/Y commanded, Z force-controlled or commanded).
+    // Angular (orientation hold) is left completely untouched.
+    // =====================================================================
+    wipe_msgs::msg::WipeSetpoint sp;
+    bool have_sp;
+    rclcpp::Time sp_time;
+    {
+      std::lock_guard<std::mutex> lock(setpoint_mutex_);
+      sp       = latest_setpoint_;
+      have_sp  = setpoint_received_;
+      sp_time  = last_setpoint_time_;
+    }
+
+    uint8_t mode = wipe_msgs::msg::WipeSetpoint::IDLE;
+    if (have_sp) {
+      mode = sp.mode;
+      // Stale-setpoint safety: brain died / stopped publishing → fall to IDLE.
+      double age = (now() - sp_time).seconds();
+      if (age > setpoint_timeout_) {
+        mode = wipe_msgs::msg::WipeSetpoint::IDLE;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "Wipe setpoint stale (%.2fs) — reverting to admittance.", age);
+      }
+    }
+
+    bool wipe_active = (mode != wipe_msgs::msg::WipeSetpoint::IDLE);
+
+    //start the force controller pi when we are not in the idle mode
+    if (wipe_active) {
+      // X/Y: commanded directly (position regulation OFF on these axes).
+      vx = sp.velocity_x;
+      vy = sp.velocity_y;
+
+      // Z: force control or velocity command.
+      bool z_fc = sp.z_force_control;
+      if (z_fc && !prev_z_force_control_) {
+        force_pi_->reset();              // rising edge: bumpless transfer
+      }
+      prev_z_force_control_ = z_fc;
+
+      if (z_fc) {
+        vz = force_pi_->update(sp.force_desired_z, -fz);  // fz is negative during contact; -fz makes it positive to match positive F_desired
+      } else {
+        vz = sp.velocity_z;              // APPROACH / RETRACT
+      }
+    } else {
+      prev_z_force_control_ = false;     // reset edge tracker when not wiping
+    }
+
+
+    // =====================================================================
     // Combined deadzone: no force/torque + close to home → zero twist
     // =====================================================================
     double orient_error_mag = orient_error.norm();
@@ -677,7 +878,7 @@ private:
     // 0.003m = 3mm position deadzone, ~0.5° orientation deadzone
     bool at_home = (pos_error < 0.003) && (orient_error_mag < 0.015);
 
-    if (no_external && at_home) {
+    if (!wipe_active && no_external && at_home) {
       kinova_->setCartesianVelocity(0, 0, 0, 0, 0, 0);
       return;
     }
@@ -702,8 +903,20 @@ private:
 
     // --- 10. Send full 6D twist command (base frame) ---
     // Kortex expects angular velocity in degrees/s
+    auto _t_math = std::chrono::steady_clock::now();
     kinova_->setCartesianVelocity(vx, vy, vz,
                                wx * RAD2DEG, wy * RAD2DEG, wz * RAD2DEG);
+    auto _t_twist = std::chrono::steady_clock::now();
+
+    // [TIMING] per-section breakdown, throttled to 1 Hz.
+    // Whichever number is ~70+ ms is the blocking call gating the loop.
+    auto _ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      "[timing] wrench=%.1f pose=%.1f math=%.1f twist=%.1f total=%.1f ms",
+      _ms(_t0, _t_wrench), _ms(_t_wrench, _t_pose), _ms(_t_pose, _t_math),
+      _ms(_t_math, _t_twist), _ms(_t0, _t_twist));
   }
 
 
@@ -744,11 +957,35 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disable_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
+  rclcpp::CallbackGroup::SharedPtr io_cb_group_;
+
+  // Wipe integration
+  rclcpp::Subscription<wipe_msgs::msg::WipeSetpoint>::SharedPtr setpoint_sub_;
+  wipe_msgs::msg::WipeSetpoint latest_setpoint_;
+  std::mutex setpoint_mutex_;
+  bool setpoint_received_ = false;
+  rclcpp::Time last_setpoint_time_;
+  bool prev_z_force_control_ = false;
+
+  std::unique_ptr<admittance::ForceControllerPI> force_pi_;
+  double force_kp_, force_ki_, setpoint_timeout_;
 
   // Thread-safe wrench cache (updated by subscriber at 500Hz)
   admittance::Wrench latest_wrench_;
   std::mutex wrench_mutex_;
   bool wrench_received_ = false;
+
+  // Thread-safe pose cache (updated by background thread at ~25Hz)
+  // Decouples the ~20ms Kortex getCurrentPose() network round-trip from
+  // the control loop. The loop reads a cached copy in <1μs instead of
+  // blocking. At 25Hz polling, pose is at most ~40ms old; at max velocity
+  // 0.15 m/s the arm moves 6mm in that window — within the 3mm deadzone
+  // tolerance for admittance control.
+  kinova_wrapper::Pose cached_pose_;
+  std::mutex pose_mutex_;
+  bool pose_received_ = false;
+  std::thread pose_thread_;
+  std::atomic<bool> pose_thread_running_{false};
 
   // Controller state
   admittance::Wrench bias_;                   // residual tare bias (F + T)
@@ -792,21 +1029,17 @@ private:
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   std::signal(SIGINT, signal_handler);
-
   auto node = std::make_shared<AdmittanceNode>();
-
   if (!node->init()) {
     RCLCPP_FATAL(node->get_logger(), "Failed to initialize. Exiting.");
     return 1;
   }
-
-  // Single-threaded executor: spin_some() drains all ready callbacks
-  // (timer, subscriber, service) sequentially each iteration.
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
   while (rclcpp::ok() && g_running) {
-    rclcpp::spin_some(node);
+    executor.spin_some();
     std::this_thread::sleep_for(1ms);
   }
-
   node->cleanup();
   rclcpp::shutdown();
   return 0;

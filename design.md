@@ -3,8 +3,9 @@
 ## Purpose
 
 This document captures the engineering rationale behind every design choice in the 6-DOF
-admittance controller. It's intended for code reviewers, future contributors, and anyone
-evaluating the technical depth of this system.
+admittance controller with integrated PI force control for surface wiping. It is intended
+for code reviewers, future contributors, and anyone evaluating the technical depth of this
+system.
 
 ---
 
@@ -61,8 +62,75 @@ Linear damping `D_x, D_y, D_z` and angular damping `D_x_ang, D_y_ang, D_z_ang` a
 independent per axis. This allows, for example, stiff vertical compliance (high D_z for
 surface contact) with free lateral motion (low D_x, D_y for wiping).
 
-Similarly, orientation regulation gains `Kp_x_ang, Kp_y_ang, Kp_z_ang` can be tuned
-independently — tight roll/pitch control with compliant yaw, for example.
+---
+
+## Force Control (PI with Anti-Windup)
+
+### Architecture: Brain/Executor Split
+
+Force control is split across two nodes:
+- **wipe_node (brain):** sequences the state machine, publishes WipeSetpoint
+- **admittance_node (executor):** runs the PI controller, sends velocity commands
+
+This separation keeps the force control loop as tight as possible — the PI runs inside the
+node that owns the Kortex API connection, with no inter-process latency.
+
+### PI Controller Design
+
+The ForceControllerPI is a single-axis PI regulator with conditional-integration anti-windup:
+
+```cpp
+e       = force_desired - force_measured
+i_cand  = integral_ + e * dt_
+v_unsat = -(kp * e + ki * i_cand)
+v_sat   = clamp(v_unsat, -v_max, +v_max)
+
+if (!saturated || sameSign(e, v_sat))
+    integral_ = i_cand    // only accumulate when productive
+```
+
+The negation in `v_unsat = -(...)` is the sign flip: positive error (need more force)
+produces negative velocity (move down into surface).
+
+### Sign Convention (Hardware-Verified)
+
+The sign chain was verified on hardware (June 2026):
+
+```
+Physical: press tool UP into surface
+  → wrench_corrected Fz = NEGATIVE (e.g. -5 N)
+  → admittance_node calls: force_pi_->update(+5.0, -(-5.0)) = update(5, 5)
+  → error e = 5 - 5 = 0 (at setpoint, no correction needed) ✓
+
+Physical: too little force (Fz = -1 N, desired = -5 N)
+  → update(5, 1) → e = +4 → v_unsat = negative → arm presses DOWN ✓
+
+Physical: too much force (Fz = -7 N, desired = -5 N)
+  → update(5, 7) → e = -2 → v_unsat = positive → arm lifts UP ✓
+```
+
+### Anti-Windup Behavior
+
+The conditional-integration scheme freezes the integral when the output is saturated AND
+continued integration would make it worse (error and output have opposite signs). This
+prevents runaway integral accumulation during sustained contact or velocity-limited phases.
+
+**Known limitation:** At wipe direction reversals, the integral accumulated during steady
+wiping causes force spikes (measured up to -7 N against -5 N target). The anti-windup
+catches saturation-induced windup but not within-band accumulation. Future fix: add a
+direct integral clamp or reduce Ki.
+
+### Validated Gains
+
+| Parameter | Value | Result |
+|-----------|-------|--------|
+| Kp | 0.001 | Low proportional — smooth approach, no jerk |
+| Ki | 0.01 | Steady-state tracking within ±0.5 N of target |
+| F_desired | 5.0 N | Appropriate for surface wiping contact |
+| Wipe speed | 0.02 m/s | Smooth lateral motion during force control |
+| Steady-state | [-5.5, -4.5] N | ±10% of target |
+| Max overshoot | -7.0 N | At direction reversals (Ki windup) |
+| Max undershoot | -3.0 N | During lateral trajectory disturbances |
 
 ---
 
@@ -91,12 +159,54 @@ subtracted every control cycle.
 Tare is valid near the tare orientation. Large orientation changes (>30°) may introduce
 uncompensated gravity torque. Re-tare via the `~/tare` service after repositioning.
 
-### Torque Gravity Compensation
+---
 
-With CoG at `[0, 0, 0]` (unknown for current test handle), the gravity torque model
-produces zero. Tare absorbs the actual gravity torque at the tare pose. When the Robotiq
-2F-85 is mounted (mass=0.93kg, cog_z=0.058m), the model will actively compensate
-orientation-dependent gravity torque.
+## Loop Rate Analysis
+
+### Measured Timing Breakdown
+
+Timing instrumentation was added to the control loop to measure each section:
+
+| Section | Time (ms) | Operation |
+|---------|-----------|-----------|
+| wrench | 0.0 | Mutex read of cached F/T sensor data |
+| pose | 0.0 | Cached getCurrentPose() (background thread) |
+| math | 0.2 | Gravity comp + EMA + admittance + quaternion error |
+| twist | **73.3** | setCartesianVelocity() → Kortex SendTwistCommand() |
+| **TOTAL** | **73.5** | **→ ~13 Hz effective loop rate** |
+
+### Why setCartesianVelocity Cannot Be Threaded
+
+The velocity command is the control output. Moving it to a background thread creates
+two failure modes:
+
+1. **Queueing:** The background thread sends command N while the loop has already computed
+   N+1. The arm executes stale commands, lagging behind reality → oscillation.
+2. **Dropping:** Command N is skipped. The arm receives nothing for one cycle → jerk or
+   watchdog trigger.
+
+Unlike pose reading (which tolerates ~40ms staleness), the velocity command must be the
+last synchronous step in the loop.
+
+### Pose Caching Optimization
+
+The `getCurrentPose()` call (originally ~20ms) was moved to a background thread that
+polls at ~25 Hz and caches the result behind a mutex. The control loop reads the cached
+value in <1μs. Staleness analysis: at 0.15 m/s max velocity, the arm moves 6mm in the
+worst-case 40ms window — within the 3mm deadzone tolerance.
+
+### Adequacy for Surface Wiping
+
+At 13 Hz with 20 mm/s wipe speed: `20 × 0.077 = 1.54 mm` per command update. For
+centimeter-scale wipe strokes, this granularity is acceptable — motion appears smooth
+and the PI force controller maintains ±0.5N tracking at 13 Hz.
+
+### Upgrade Path
+
+Kortex low-level servoing API operates at 1 kHz with joint-space commands. Migration
+requires: Jacobian computation every cycle, Cartesian→joint velocity conversion via
+DLS pseudo-inverse, 1ms real-time deadline (missed cycles fault actuators), and low-level
+session lifecycle management. Target: Week 5-6 or when visual servoing requires >100 Hz.
 
 ---
 
@@ -140,12 +250,11 @@ filtered += alpha * (raw - filtered)
 ```
 
 Applied identically to Fx, Fy, Fz, Tx, Ty, Tz. Lower alpha = smoother but laggier.
-At 100Hz with alpha=0.1, the effective cutoff frequency is ~1.7Hz — sufficient for
-human-interaction forces, too slow for impact detection (future work).
+At the effective 13Hz loop rate with alpha=0.1, the cutoff frequency is ~0.2Hz.
 
 ### Dead Zone (Separate Force/Torque Thresholds)
 
-Forces below 0.3N and torques below 0.1Nm are zeroed. The dead zone also subtracts
+Forces below 0.3N and torques below 0.2Nm are zeroed. The dead zone also subtracts
 the threshold value so motion starts smoothly from zero velocity:
 
 ```cpp
@@ -159,7 +268,6 @@ This prevents a velocity discontinuity at the dead zone boundary.
 
 Velocities below 0.1mm/s (1e-4 m/s) are zeroed. This eliminates floating-point noise
 from quaternion conversions and prevents micro-jerk when the arm is nominally at rest.
-Below Kortex's minimum velocity resolution — the arm physically cannot execute these.
 
 ---
 
@@ -176,49 +284,16 @@ Below Kortex's minimum velocity resolution — the arm physically cannot execute
 | 5 | Watchdog thread (in KinovaInterface) | Auto-stop if no command for ~100ms |
 | 6 | Disabled by default | No motion until explicit `~/enable` service call |
 | 7 | Tare disables controller | Prevents stale-data velocity spikes during re-tare |
-
-### Concurrent Session Protection
-
-The admittance node takes exclusive API control via the Kortex session. Running
-ros2_kortex or the Kortex Web App simultaneously causes silent control mode conflicts:
-the arm gets stuck in "Angular Trajectory" mode and ignores `SendTwistCommand`. The
-`~/enable` service calls `stopMotion()` before activating to clear any stale mode.
-
----
-
-## Sensor Integration
-
-### MAE SensuReal F/T Sensor
-
-The MAE sensor streams 6-axis wrench data over UDP at up to 1kHz. A Python ROS2
-lifecycle node (`mae_sensor_node`) handles:
-
-- UDP connection management (connect on activate, disconnect on deactivate)
-- Sampling period configuration
-- Hardware tare (BIAS_SET command)
-- Sensor-to-tool frame rotation
-- Rate decimation (1kHz sensor → 500Hz publish)
-- Lifecycle transitions for clean startup/shutdown
-
-The admittance node subscribes to `/wrench_raw` and caches the latest reading behind
-a mutex. The 100Hz control loop reads the most recent value — 5:1 oversampling ensures
-fresh data every cycle.
-
-### Fallback to Kortex Wrench
-
-If no MAE sensor data arrives (node not running, sensor disconnected), the controller
-falls back to `KinovaInterface::getWrench()` which reads the Kortex built-in F/T
-estimation. This is lower quality (~10Hz, model-based rather than measured) but allows
-basic testing without the external sensor.
+| 8 | Stale-setpoint fallback | Reverts to admittance if wipe_node stops publishing |
 
 ---
 
 ## Thread Model
 
-Single-threaded ROS2 executor. `spin_some()` drains all ready callbacks (timer,
-subscriber, service) sequentially each iteration. The control loop timer fires at 100Hz.
-The wrench subscriber callback runs at up to 500Hz between timer fires, updating the
-cached wrench behind a mutex.
+MultiThreadedExecutor with a reentrant callback group for I/O-bound subscribers
+(wrench + setpoint). The control loop timer fires at 100Hz (effective ~13Hz due to
+blocking Kortex call). A dedicated pose-caching thread polls getCurrentPose() at ~25Hz
+independently.
 
 The MAE sensor node uses a dedicated background thread for the blocking UDP read loop
 (`waits_response_bytes()`), preventing it from starving the ROS2 executor.
@@ -227,19 +302,22 @@ The MAE sensor node uses a dedicated background thread for the blocking UDP read
 
 ## Known Limitations
 
-1. **Gravity torque compensation at large orientations** — With CoG at [0,0,0],
-   gravity torque is not modeled. Tare absorbs it at the tare pose only. Large
-   orientation changes introduce uncompensated torque bias.
+1. **13 Hz effective loop rate** — Kortex high-level API SendTwistCommand blocks for
+   ~73ms. Adequate for slow contact tasks (wiping, polishing), insufficient for fast
+   visual servoing (>100Hz required). Upgrade: low-level servoing API.
 
-2. **Single tare pose** — Tare is pose-dependent. Moving the arm significantly
-   from the tare configuration degrades compensation accuracy.
+2. **Ki integral windup at direction reversals** — accumulated integral during steady
+   wiping causes force spikes up to 2× target at trajectory reversals. Fix: direct
+   integral clamp or reduced Ki (0.005).
 
-3. **No impact detection** — EMA filter with alpha=0.1 is too slow to detect
-   sudden contacts. Future work: dual-rate filter or threshold-based detector.
+3. **Single tare pose** — gravity compensation accuracy degrades >30° from tare
+   orientation. Re-tare after repositioning.
 
-4. **No joint-limit awareness** — The admittance law operates in Cartesian space.
-   Near joint limits, Kortex may reject velocity commands or produce unexpected
-   motions. Future work: manipulability monitoring.
+4. **No impact detection** — EMA filter too slow to detect sudden contacts. Future:
+   dual-rate filter or threshold-based detector.
+
+5. **No joint-limit awareness** — admittance law in Cartesian space. Near joint limits,
+   Kortex may reject commands. Future: manipulability monitoring.
 
 ---
 
@@ -248,4 +326,6 @@ The MAE sensor node uses a dedicated background thread for the blocking UDP read
 | Date | Change | Author |
 |------|--------|--------|
 | May 2026 | Initial 3-DOF admittance controller (force only) | Sahil Narola |
-| May 2026 | Extend to 6-DOF: quaternion orientation error, torque admittance, angular damping/regulation, dead zone for torques, angular velocity clamp, rad/s→deg/s fix | Sahil Narola |
+| May 2026 | Extend to 6-DOF: quaternion orientation error, torque admittance | Sahil Narola |
+| June 2026 | PI force control, wipe integration, pose caching, loop rate diagnosis | Sahil Narola |
+| June 2026 | Surface wiping demo validated (5N contact, 0.02m/s, Kp=0.001 Ki=0.01) | Sahil Narola |

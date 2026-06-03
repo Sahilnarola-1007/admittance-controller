@@ -1,29 +1,36 @@
 # Admittance Controller — Kinova Gen3 7-DOF
 
-Full 6-DOF velocity-based admittance controller for the Kinova Gen3 arm with
-MAE SensuReal F/T sensor. Push or twist the end-effector and it yields
-compliantly. Release it and it springs back to the original pose — both
-position and orientation.
+Full 6-DOF velocity-based admittance controller with PI force control for the
+Kinova Gen3 arm with MAE SensuReal F/T sensor. Push or twist the end-effector
+and it yields compliantly. Release it and it springs back to the original pose.
+Switch to force-controlled wiping and the arm maintains constant contact force
+while executing lateral trajectories.
 
-Built for force-controlled contact tasks: surface wiping, polishing, guided
-manipulation, and as the foundation for learned contact policies.
+Successfully demonstrated surface wiping with 5 N contact force at 0.02 m/s
+wipe speed, June 2026. Steady-state force band: [-5.5, -4.5] N.
 
 ## What It Does
 
-The controller maps external forces **and torques** to compliant Cartesian
-motion using a velocity-based admittance law:
+Two operating modes in one node:
+
+**6-DOF Admittance (default):** Maps external forces and torques to compliant
+Cartesian motion using a velocity-based admittance law:
 
 ```
 Linear:   v = R · (F / D_linear)  + Kp · (pos_desired − pos_current)
 Angular:  ω = R · (τ / D_angular) + Kp_angular · 2 · q_err.vec()
 ```
 
-Orientation error uses **quaternion representation** — no Euler angle
-subtraction, no gimbal lock, no discontinuities. The short-path fix
-(`if q_err.w < 0 → negate`) prevents >180° corrections.
+Orientation error uses quaternion representation — no gimbal lock, no
+discontinuities. The short-path fix (`if q_err.w < 0 → negate`) prevents
+\>180° corrections.
 
-At steady state with constant 5N force (D=150, Kp=2): equilibrium
-displacement = 16.7mm. Remove the force → arm returns to home.
+**Force-Controlled Wiping (via WipeSetpoint):** When the wipe_node publishes
+setpoints, the admittance node executes them:
+- APPROACH: velocity-commanded descent until contact detected
+- WIPE: Z-axis force control (PI with anti-windup) + lateral X/Y from trajectory
+- RETRACT: velocity-commanded lift-off
+- Angular orientation hold remains active in all modes
 
 ## Architecture
 
@@ -31,34 +38,76 @@ displacement = 16.7mm. Remove the force → arm returns to home.
 MAE SensuReal F/T Sensor (UDP, 1kHz)
   │
   ▼
-mae_sensor_node (Python lifecycle, publishes /wrench_raw at 500Hz)
+mae_sensor_node (Python lifecycle, /wrench_raw at 500Hz)
   │
   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      admittance_node (C++, 100Hz)               │
-│                                                                 │
-│  /wrench_raw ---→ Gravity Comp ---→ EMA Filter ---→ Dead Zone   │
-│                  (model-based)    (6 channels)   (F: 0.3N,      │
-│                                                   T: 0.2Nm)     │
-│                       │                                         │
-│                       ▼                                         │
-│              ┌─────────────────┐     ┌──────────────────────┐   │
-│              │     LINEAR      │     │       ANGULAR        │   │
-│              │F_base = R·F_tool│     │  q_err = q_d·q_c⁻¹   │   │
-│              │  v = F/D + Kp·e │     │  ω = τ/D + Kp·2·q.v  │   │
-│              └────────┬────────┘     └──────────┬───────────┘   │
-│                       │                         │               │
-│                       ▼                         ▼               │
-│                 ┌─────────────────────────────────┐             │
-│                 │  Safety Clamp + Dead Zone Check │             │
-│                 │  v < 0.2m/s   ω < 0.9rad/s      │             │
-│                 └──────────────┬──────────────────┘             │
-│                                │                                │
-│                                ▼                                │
-│                   SendTwistCommand (6D, base frame)             │
-│                   (angular: rad/s → deg/s for Kortex)           │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                 admittance_node (C++, ~13Hz effective)              │
+│                                                                     │
+│  /wrench_raw ──→ Gravity Comp ──→ EMA Filter ──→ Dead Zone         │
+│                  (model-based)    (6 channels)   (F:0.3N, T:0.2Nm) │
+│                       │                                             │
+│                       ├── wrench_corrected (published)              │
+│                       │                                             │
+│                       ▼                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │               Mode Router (WipeSetpoint)                     │   │
+│  │                                                              │   │
+│  │  IDLE:      6-DOF admittance (F/D + Kp·e for all axes)      │   │
+│  │  APPROACH:  vz = -approach_speed (descend)                   │   │
+│  │  WIPE:      vz = PI(F_desired, -fz)  vx,vy = trajectory     │   │
+│  │  RETRACT:   vz = +retract_speed (lift off)                   │   │
+│  └──────────────────────┬───────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  Quaternion Orientation Hold (active in ALL modes)            │   │
+│  │  q_err = q_desired · q_current⁻¹ → ω = Kp_ang · 2·q_err.v  │   │
+│  └──────────────────────┬───────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  Safety: velocity clamp + dead zone + sub-threshold zero     │   │
+│  │  v < 0.15 m/s    ω < 0.5 rad/s    |v| < 0.1mm/s → 0         │   │
+│  └──────────────────────┬───────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼                                          │
+│               SendTwistCommand (base frame, angular in deg/s)       │
+│               ≈73ms per call → ~13Hz effective loop rate            │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+## Sign Convention (Hardware-Verified)
+
+| Action | wrench_corrected Fz | vz to correct |
+|--------|---------------------|---------------|
+| Press into surface (up) | **negative** | positive (ease off) |
+| Pull away from surface (down) | **positive** | negative (push back) |
+| No contact | ≈ 0 | 0 |
+
+The PI controller receives `-fz` to flip the negative contact reading to
+positive, matching the positive `force_desired_z`. This is the only sign
+flip in the chain.
+
+## Loop Rate Limitation
+
+The control loop is configured at 100 Hz but achieves **~13 Hz** due to
+Kortex high-level API latency:
+
+| Section | Time | What |
+|---------|------|------|
+| wrench read | 0.0 ms | mutex-cached from 500 Hz subscriber |
+| getCurrentPose | 0.0 ms | cached by background pose thread |
+| control math | 0.2 ms | gravity comp + EMA + admittance + quaternion |
+| setCartesianVelocity | **73 ms** | Kortex SendTwistCommand gRPC round-trip |
+
+The `SendTwistCommand` call cannot be parallelized — it is the control output
+and must be synchronous. Kinova documents 40 Hz max for high-level commands.
+At 13 Hz with 20 mm/s wipe speed: 1.5 mm between updates — adequate for
+surface wiping.
+
+**Upgrade path:** Kortex low-level servoing API (1 kHz, joint-space commands,
+requires user-side Jacobian computation and DLS IK).
 
 ## Hardware
 
@@ -67,32 +116,6 @@ mae_sensor_node (Python lifecycle, publishes /wrench_raw at 500Hz)
 | Arm | Kinova Gen3 7-DOF | Manipulator |
 | F/T Sensor | MAE Robotics SensuReal | 6-axis wrench at 1kHz via UDP |
 | End-Effector | Test handle (175g) | Validation payload (Robotiq 2F-85 next) |
-
-The MAE sensor mounts between the flange and the tool. A Python lifecycle
-node (`mae_sensor_node`) handles UDP streaming, sensor→tool frame rotation
-(Rz 90°), and publishes `WrenchStamped` at 500Hz.
-
-## Key Design Decisions
-
-**Quaternion orientation error** — Euler angle subtraction breaks at gimbal
-lock (pitch ±90°), wraps at ±180°, and doesn't represent a unique rotation.
-Quaternion error `q_err = q_desired · q_current⁻¹` gives a single, smooth,
-singularity-free rotation with `2 · q_err.vec() ≈ θ_error` in radians.
-
-**Velocity-based admittance (not impedance)** — The arm's internal position
-controller handles trajectory tracking. We command Cartesian velocities, not
-torques. This is safer and doesn't require a dynamic model of the arm.
-
-**Model-based gravity compensation** — `F_tool = R^T · [0, 0, −mg]` updated
-every cycle from Kortex Euler angles. Residual error (imprecise mass, CoG,
-friction) captured by tare at startup.
-
-**Separate angular/linear gains** — Per-axis damping and regulation gains
-allow independent tuning of translational compliance and rotational stiffness.
-
-**Rad/s → deg/s conversion** — Kortex `SendTwistCommand` expects angular
-velocity in degrees/s, not rad/s. Missing this conversion causes the arm to
-appear frozen rotationally (0.05 rad/s interpreted as 0.05°/s ≈ nothing).
 
 ## Build
 
@@ -107,158 +130,88 @@ colcon build --packages-select admittance_controller
 source install/setup.bash
 ```
 
-> **Mock build warning:** `kinova_wrapper` defaults to `USE_KORTEX_MOCK=ON`.
-> Mock builds silently accept velocity commands without sending them to the
-> arm. Always pass `-DUSE_KORTEX_MOCK=OFF` for hardware.
-
 ## Run
 
 ```bash
-# Launch both nodes (mae_sensor_node + admittance_node)
+# Launch both nodes
 ros2 launch admittance_controller admittance.launch.py
 
-# Transition MAE sensor to active (separate terminal)
+# Transition MAE sensor to active
 ros2 lifecycle set /mae_sensor_node configure
 ros2 lifecycle set /mae_sensor_node activate
 
-# After tare completes — enable the controller
+# Enable compliant motion
 ros2 service call /admittance_node/enable std_srvs/srv/Trigger
 ```
-
-The node connects to the arm, captures the current pose as the home target
-(position + orientation as quaternion), tares the F/T sensor, and starts the
-100Hz control loop in disabled state. Call `~/enable` to begin compliant motion.
 
 ## Services
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `~/tare` | `std_srvs/Trigger` | Re-zero sensor bias at current orientation. Disables controller during tare. |
-| `~/enable` | `std_srvs/Trigger` | Start compliant motion. Calls `stopMotion()` first to clear stale Kortex control modes. |
-| `~/disable` | `std_srvs/Trigger` | Stop velocity commands. Watchdog auto-stops arm (~100ms). |
+| `~/tare` | `std_srvs/Trigger` | Re-zero sensor bias. Disables controller during tare. |
+| `~/enable` | `std_srvs/Trigger` | Start compliant motion. Clears stale Kortex modes first. |
+| `~/disable` | `std_srvs/Trigger` | Stop velocity commands. Watchdog auto-stops arm. |
 
 ## Topics
 
-| Topic | Type | Direction | Description |
-|-------|------|-----------|-------------|
-| `/wrench_raw` | `WrenchStamped` | Subscribe | Raw F/T from MAE sensor (tool frame, 500Hz) |
-| `~/wrench_corrected` | `WrenchStamped` | Publish | After gravity comp + EMA filter + dead zone |
+| Topic | Type | Dir | Hz | Description |
+|-------|------|-----|-----|-------------|
+| `/wrench_raw` | WrenchStamped | Sub | 500 | Raw F/T from MAE sensor (tool frame) |
+| `~/wrench_corrected` | WrenchStamped | Pub | ~13 | After gravity comp + filter + dead zone |
+| `/wipe_node/wipe_setpoint` | WipeSetpoint | Sub | 50 | Commands from wipe_node brain |
 
 ## Parameters
 
-All parameters are dynamically reconfigurable at runtime via `ros2 param set`.
-
-### Linear Control
+All dynamically reconfigurable via `ros2 param set`.
 
 | Parameter | Default | Units | Description |
 |-----------|---------|-------|-------------|
-| `damping_x/y/z` | 150.0 | N·s/m | Force needed to produce 1 m/s velocity. Higher = stiffer. |
-| `position_gain` | 2.0 | 1/s | Spring-back speed. Equilibrium displacement = F / (D × Kp). |
-
-### Angular Control
-
-| Parameter | Default | Units | Description |
-|-----------|---------|-------|-------------|
-| `damping_x/y/z_angular` | 5.0 | Nm·s/rad | Torque needed to produce 1 rad/s angular velocity. |
-| `Kp_x/y/z_angular` | 0.5 | 1/s | Orientation regulation gain (per radian of quaternion error). |
-
-### Safety
-
-| Parameter | Default | Units | Description |
-|-----------|---------|-------|-------------|
-| `max_velocity` | 0.2 | m/s | Linear velocity clamp. |
-| `max_angular_velocity` | 0.9 | rad/s | Angular velocity clamp (~28.6°/s). |
-| `dead_zone_force` | 0.3 | N | Force readings below this are zeroed. |
-| `dead_zone_torque` | 0.2 | Nm | Torque readings below this are zeroed. |
-
-### Gravity Model
-
-| Parameter | Default | Units | Description |
-|-----------|---------|-------|-------------|
-| `gripper_mass` | 0.175 | kg | Payload mass (test handle). Robotiq 2F-85: 0.93 kg. |
-| `cog_x/y/z` | 0.0 | m | Center of gravity in tool frame. |
-
-### Filter
-
-| Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
-| `filter_alpha` | 0.1 | 0.01–1.0 | EMA coefficient. Lower = smoother, laggier. Applied to all 6 channels. |
-
-## Live Tuning
-
-```bash
-# Make more compliant (linear)
-ros2 param set /admittance_node damping_x 80.0
-
-# Make angular control softer
-ros2 param set /admittance_node damping_x_angular 3.0
-ros2 param set /admittance_node Kp_x_angular 0.5
-
-# Adjust dead zone
-ros2 param set /admittance_node dead_zone_force 0.5
-ros2 param set /admittance_node dead_zone_torque 0.2
-
-# Adjust filter responsiveness
-ros2 param set /admittance_node filter_alpha 0.2
-```
-
-## Tuning Guide
-
-Start conservative and loosen gradually. Always have the e-stop in hand.
-
-| Step | Parameter | Value | What to Watch |
-|------|-----------|-------|---------------|
-| 1 | Defaults | D=150, Kp=2 | Arm should not move on its own |
-| 2 | Lower linear D | D=100 | Push gently — slight compliance |
-| 3 | Lower further | D=60 | Feels like a firm spring |
-| 4 | Lower angular D | D_ang=5 | Twist EE — should rotate and spring back |
-| 5 | Adjust dead zone | ±0.1N | Creep → raise. Unresponsive → lower. |
-| 6 | Adjust filter | ±0.05 | Jittery → lower alpha. Laggy → raise. |
+| `damping_x/y/z` | 150.0 | N·s/m | Linear damping. Higher = stiffer. |
+| `damping_x/y/z_angular` | 5.0 | Nm·s/rad | Angular damping. |
+| `position_gain` | 2.0 | 1/s | Spring-back speed. |
+| `Kp_x/y/z_angular` | 0.5 | 1/s | Orientation regulation gain. |
+| `dead_zone_force` | 0.3 | N | Force noise threshold. |
+| `dead_zone_torque` | 0.2 | Nm | Torque noise threshold. |
+| `max_velocity` | 0.15 | m/s | Linear velocity clamp. |
+| `max_angular_velocity` | 0.5 | rad/s | Angular velocity clamp. |
+| `filter_alpha` | 0.1 | — | EMA coefficient. Lower = smoother. |
+| `gripper_mass` | 0.175 | kg | Payload mass (test handle). |
+| `force_kp` | 0.001 | — | PI proportional gain (wipe Z force). |
+| `force_ki` | 0.01 | — | PI integral gain (wipe Z force). |
 
 ## Safety
 
-The controller has multiple safety layers:
+Seven layers of protection:
 
-- **Velocity clamp**: linear (0.2 m/s) and angular (0.5 rad/s) hard limits
-- **Dead zones**: force (0.3N) and torque (0.1Nm) reject sensor noise/drift
-- **Position + orientation deadzone**: no force + close to home → zero twist
-  (3mm position, ~0.86° orientation)
-- **Sub-threshold suppression**: velocities below 0.1mm/s zeroed to prevent
-  floating-point jerk
-- **Watchdog**: `KinovaInterface` auto-stops arm if no velocity command
-  received for ~100ms (node crash protection)
-- **Disabled by default**: requires explicit `~/enable` service call
-- **Tare safety**: controller disabled during tare to prevent stale-data spikes
-- **Exclusive API control**: do NOT run alongside ros2_kortex or the Kortex
-  Web App — concurrent sessions cause silent control mode conflicts
+1. **Dead zone** — force (0.3N) + torque (0.2Nm) reject sensor noise
+2. **Position + orientation deadzone** — zero twist when at home, no load
+3. **Velocity clamp** — 0.15 m/s linear, 0.5 rad/s angular
+4. **Sub-threshold suppression** — velocities below 0.1 mm/s zeroed
+5. **Watchdog** — KinovaInterface auto-stops if no command for ~100ms
+6. **Disabled by default** — requires explicit `~/enable` call
+7. **Stale-setpoint fallback** — reverts to admittance if wipe_node dies
 
-## File Structure
+## Known Limitations
 
-```
-admittance_controller/
-├── CMakeLists.txt
-├── package.xml
-├── README.md
-├── config/
-│   └── admittance_params.yaml          # All tunable parameters
-├── include/
-│   └── admittance_controller/
-│       └── types.hpp                   # Wrench, WrenchFilter, apply_deadzone
-├── launch/
-│   └── admittance.launch.py            # Launch mae_sensor_node + admittance_node
-└── src/
-    └── admittance_node.cpp             # 6-DOF admittance controller
+1. **13 Hz loop rate** — Kortex high-level API SendTwistCommand blocks for
+   ~73ms per call. Adequate for slow contact tasks, insufficient for fast
+   visual servoing. Fix: migrate to low-level servoing (1 kHz).
 
-mae_sensor_driver/                      # Separate package
-├── mae_sensor_node.py                  # Python lifecycle node (UDP → ROS2)
-└── ...
-```
+2. **Ki integral windup at reversals** — during wipe direction changes, the
+   accumulated integral causes force spikes up to -7N (target -5N). Fix:
+   add direct integral clamp or reduce Ki.
+
+3. **Single tare pose** — gravity compensation degrades >30° from tare
+   orientation. Re-tare via `~/tare` after repositioning.
+
+4. **No joint-limit awareness** — admittance law operates in Cartesian space.
+   Near joint limits, Kortex may reject velocity commands.
 
 ## Dependencies
 
-- [kinova_wrapper](https://github.com/Sahilnarola-1007/kinova-wrapper) — C++ wrapper for Kortex SDK
-- [mae_fts_sdk](https://github.com/MAE-Robotics) — MAE SensuReal Python SDK
-- ROS2 Jazzy, Eigen3, geometry_msgs, std_srvs
+- [kinova_wrapper](https://github.com/Sahilnarola-1007/kinova-wrapper)
+- [mae_fts_sdk](https://github.com/MAE-Robotics) (system-wide pip install)
+- ROS2 Jazzy, Eigen3, geometry_msgs, std_srvs, wipe_msgs
 
 ## Author
 
