@@ -34,47 +34,66 @@ setpoints, the admittance node executes them:
 
 ## Architecture
 
-```
-MAE SensuReal F/T Sensor (UDP, 1kHz)
-  │
-  ▼
-mae_sensor_node (Python lifecycle, /wrench_raw at 500Hz)
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                 admittance_node (C++, ~13Hz effective)              │
-│                                                                     │
-│  /wrench_raw ──→ Gravity Comp ──→ EMA Filter ──→ Dead Zone         │
-│                  (model-based)    (6 channels)   (F:0.3N, T:0.2Nm) │
-│                       │                                             │
-│                       ├── wrench_corrected (published)              │
-│                       │                                             │
-│                       ▼                                             │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │               Mode Router (WipeSetpoint)                     │   │
-│  │                                                              │   │
-│  │  IDLE:      6-DOF admittance (F/D + Kp·e for all axes)      │   │
-│  │  APPROACH:  vz = -approach_speed (descend)                   │   │
-│  │  WIPE:      vz = PI(F_desired, -fz)  vx,vy = trajectory     │   │
-│  │  RETRACT:   vz = +retract_speed (lift off)                   │   │
-│  └──────────────────────┬───────────────────────────────────────┘   │
-│                          │                                          │
-│                          ▼                                          │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  Quaternion Orientation Hold (active in ALL modes)            │   │
-│  │  q_err = q_desired · q_current⁻¹ → ω = Kp_ang · 2·q_err.v  │   │
-│  └──────────────────────┬───────────────────────────────────────┘   │
-│                          │                                          │
-│                          ▼                                          │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  Safety: velocity clamp + dead zone + sub-threshold zero     │   │
-│  │  v < 0.15 m/s    ω < 0.5 rad/s    |v| < 0.1mm/s → 0         │   │
-│  └──────────────────────┬───────────────────────────────────────┘   │
-│                          │                                          │
-│                          ▼                                          │
-│               SendTwistCommand (base frame, angular in deg/s)       │
-│               ≈73ms per call → ~13Hz effective loop rate            │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph sensor["🔧 MAE SensuReal F/T Sensor"]
+        S1["UDP Stream @ 1kHz"]
+    end
+
+    subgraph mae["🐍 mae_sensor_node"]
+        M1["Python Lifecycle Driver"]
+        M2["/wrench_raw @ 500Hz"]
+    end
+
+    subgraph admittance["⚙️ admittance_node (C++, ~13Hz effective)"]
+        direction TB
+        subgraph pipeline["Signal Processing Pipeline"]
+            direction LR
+            GC["Gravity Comp\n(model-based)"] --> EMA["EMA Filter\n(6 channels)"] --> DZ["Dead Zone\n(F:0.3N T:0.2Nm)"]
+        end
+
+        WC["/wrench_corrected\n(published)"]
+
+        subgraph router["Mode Router (WipeSetpoint)"]
+            IDLE["IDLE\n6-DOF admittance\nF/D + Kp·e"]
+            APP["APPROACH\nvz = -approach_speed"]
+            WIPE["WIPE\nvz = PI(F_desired, -fz)\nvx,vy = trajectory"]
+            RET["RETRACT\nvz = +retract_speed"]
+        end
+
+        subgraph orient["Quaternion Orientation Hold"]
+            QE["q_err = q_desired · q_current⁻¹\nω = Kp_ang · 2·q_err.vec()\n(active in ALL modes)"]
+        end
+
+        subgraph safety["Safety Layer"]
+            SC["Velocity Clamp: v < 0.15 m/s  ω < 0.5 rad/s\nSub-threshold: |v| < 0.1mm/s → 0"]
+        end
+
+        CMD["SendTwistCommand\n(base frame, angular in deg/s)\n≈73ms per call → ~13Hz"]
+    end
+
+    subgraph arm["🦾 Kinova Gen3 7-DOF"]
+        K1["Internal 1kHz servo"]
+    end
+
+    S1 --> M1
+    M1 --> M2
+    M2 --> GC
+    DZ --> WC
+    DZ --> router
+    router --> orient
+    orient --> safety
+    safety --> CMD
+    CMD --> K1
+
+    style sensor fill:#1a365d,stroke:#63b3ed,color:#fff
+    style mae fill:#1a365d,stroke:#63b3ed,color:#fff
+    style admittance fill:#1c2333,stroke:#4299e1,color:#e2e8f0
+    style pipeline fill:#2d3748,stroke:#a0aec0,color:#e2e8f0
+    style router fill:#2d3748,stroke:#a0aec0,color:#e2e8f0
+    style orient fill:#2d3748,stroke:#a0aec0,color:#e2e8f0
+    style safety fill:#2d3748,stroke:#a0aec0,color:#e2e8f0
+    style arm fill:#22543d,stroke:#68d391,color:#fff
 ```
 
 ## Sign Convention (Hardware-Verified)
@@ -93,6 +112,14 @@ flip in the chain.
 
 The control loop is configured at 100 Hz but achieves **~13 Hz** due to
 Kortex high-level API latency:
+
+```mermaid
+pie title Control Loop Time Budget (73.5 ms total)
+    "setCartesianVelocity (gRPC)" : 73.3
+    "Control Math" : 0.2
+    "Wrench Read" : 0.01
+    "Pose Read" : 0.01
+```
 
 | Section | Time | What |
 |---------|------|------|
@@ -181,15 +208,23 @@ All dynamically reconfigurable via `ros2 param set`.
 
 ## Safety
 
-Seven layers of protection:
+```mermaid
+flowchart LR
+    subgraph layers["7 Safety Layers"]
+        direction TB
+        L1["1. Dead Zone\nF: 0.3N  T: 0.2Nm"]
+        L2["2. Position + Orientation Deadzone\n3mm / 0.5°"]
+        L3["3. Velocity Clamp\n0.15 m/s / 0.5 rad/s"]
+        L4["4. Sub-threshold Suppression\n|v| < 0.1mm/s → 0"]
+        L5["5. Watchdog\nauto-stop @ 100ms"]
+        L6["6. Disabled by Default\nexplicit ~/enable"]
+        L7["7. Stale Setpoint Fallback\nrevert to admittance"]
 
-1. **Dead zone** — force (0.3N) + torque (0.2Nm) reject sensor noise
-2. **Position + orientation deadzone** — zero twist when at home, no load
-3. **Velocity clamp** — 0.15 m/s linear, 0.5 rad/s angular
-4. **Sub-threshold suppression** — velocities below 0.1 mm/s zeroed
-5. **Watchdog** — KinovaInterface auto-stops if no command for ~100ms
-6. **Disabled by default** — requires explicit `~/enable` call
-7. **Stale-setpoint fallback** — reverts to admittance if wipe_node dies
+        L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+    end
+
+    style layers fill:#2d3748,stroke:#e53e3e,color:#e2e8f0
+```
 
 ## Known Limitations
 
