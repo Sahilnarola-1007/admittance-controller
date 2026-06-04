@@ -170,7 +170,7 @@ ros2 launch admittance_controller admittance.launch.py
 ros2 lifecycle set /mae_sensor_node configure
 ros2 lifecycle set /mae_sensor_node activate
 
-# Taring- Completetly ground the noise(Recommanded before enabling the controller)
+# Taring- Completely ground the noise(Recommanded before enabling the controller)
 ros2 service call /admittance_node/tare std_srvs/srv/Trigger
 
 # Enable compliant motion
